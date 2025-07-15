@@ -1,129 +1,142 @@
-# ai_moodboard_app.py
-
-# TASK: Refactor this AI MoodBoard Generator to use image generation instead of image retrieval.
-
-# CURRENT STATE:
-# - The system currently uses CLIP + FAISS to find similar face images based on mood input (text or image).
-# - It retrieves existing images of faces from a dataset, not suitable for a moodboard.
-
-# GOAL:
-# - Replace the FAISS + face retrieval system with an AI image generation model like Stable Diffusion.
-# - For a given mood input (e.g., "romantic", "calm", "anxious"):
-#     → Generate 3-6 AI images matching that mood using Stable Diffusion.
-#     → Extract a color palette from the generated images (keep existing function).
-#     → Return the generated images and color palette as a moodboard.
-
-# OPTIONAL:
-# - Add a "Mood Lifting" feature that maps negative moods to positive ones before image generation.
-# - Keep the existing FANE face-to-emotion detection for image input (you already have predict_mood_from_face).
-# - Add prompts like "a cozy calm room, soft lighting, warm colors" based on mood.
-
-# IMPLEMENTATION TIPS:
-# - Use the diffusers library (HuggingFace) to run Stable Diffusion locally or via API.
-# - Prompt examples: "romantic aesthetic moodboard, pink roses, candles, soft lighting"
-# - Use a fixed pipeline: text → prompt → generate → extract_palette → return
-
-# Begin updating the generate_moodboard() function now...
-
-
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import torch
-import numpy as np
-from PIL import Image, ImageDraw
-from io import BytesIO
 import base64
+import requests
+from io import BytesIO
+from PIL import Image
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from colorthief import ColorThief
 
-from utils.color_extractor import extract_palette
-from utils.layout_selector import select_layout
 from mood_lifting_map import mood_lifting_map
-from diffusers import StableDiffusionPipeline
 
-# Setup Flask
-app = Flask(__name__)
+# Flask setup: Serve frontend from build folder
+app = Flask(__name__, static_folder="frontend/build", static_url_path="")
 CORS(app)
 
-# Device and pipeline
-device = "cuda" if torch.cuda.is_available() else "cpu"
-sd_pipe = StableDiffusionPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16 if device=="cuda" else torch.float32
-).to(device)
+# Leonardo AI Config
+LEONARDO_API_KEY = "36176ce3-1981-4c04-89c7-61ad5b00f318"
+LEONARDO_API_URL = "https://cloud.leonardo.ai/api/rest/v1/generations"
 
-# Prompt template
-PROMPT_TEMPLATE = "{mood} moodboard, aesthetic, high quality, no text, no watermark"
+PROMPT_TEMPLATE = (
+    "{mood} mood board where it has several images describing the emotion in an aesthetically "
+    "pleasing layout with elements and shapes, pinterest styled, images clearly representing the "
+    "emotion immersing the viewers"
+)
+
 def make_prompt(mood):
     return PROMPT_TEMPLATE.format(mood=mood)
 
-# Convert image to base64
 def img_to_base64(img):
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode('utf-8')
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
-# Convert base64 to BytesIO
-def base64_to_io(b64_str):
-    return BytesIO(base64.b64decode(b64_str))
+def extract_hex_palette(base64_img_data):
+    try:
+        img_data = base64.b64decode(base64_img_data)
+        img_io = BytesIO(img_data)
+        color_thief = ColorThief(img_io)
+        palette_rgb = color_thief.get_palette(color_count=5)
+        return ['#%02x%02x%02x' % rgb for rgb in palette_rgb]
+    except Exception as e:
+        print(f"[WARN] Failed to extract palette: {e}")
+        return []
+
+def fetch_leonardo_images(prompt, num_images=4):
+    headers = {
+        "Authorization": f"Bearer {LEONARDO_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "prompt": prompt,
+        "modelId": "e316348f-7773-490e-adcd-46757c738eb7",  # Phoenix 1.0
+        "num_images": num_images,
+        "width": 512,
+        "height": 512,
+        "promptMagic": True,
+        "nsfw": False
+    }
+
+    start_response = requests.post(LEONARDO_API_URL, headers=headers, json=payload)
+    if start_response.status_code != 200:
+        print("Leonardo error:", start_response.text)
+        raise Exception("Failed to start generation")
+
+    generation_id = start_response.json().get("sdGenerationJob", {}).get("generationId")
+    if not generation_id:
+        raise Exception("No generationId returned")
+
+    poll_url = f"https://cloud.leonardo.ai/api/rest/v1/generations/{generation_id}"
+    images_b64 = []
+
+    import time
+    for _ in range(20):
+        poll_response = requests.get(poll_url, headers=headers)
+        if poll_response.status_code != 200:
+            raise Exception("Polling failed")
+
+        poll_data = poll_response.json()
+        images = poll_data.get("generations_by_pk", {}).get("generated_images", [])
+
+        if images:
+            for img_info in images:
+                img_url = img_info.get("url")
+                if img_url:
+                    img_response = requests.get(img_url)
+                    if img_response.status_code == 200:
+                        img = Image.open(BytesIO(img_response.content)).convert("RGB")
+                        images_b64.append("data:image/png;base64," + img_to_base64(img))
+            break
+        time.sleep(1)
+
+    if not images_b64:
+        raise Exception("No images returned after polling")
+
+    return images_b64
 
 @app.route("/generate", methods=["POST"])
 def generate_moodboard():
     data = request.json
     text_input = data.get("text_input", "").strip()
-    image_input_b64 = data.get("image_input", None)
     lifting_mode = data.get("lifting_mode", False)
 
-    # Get mood text
     if text_input:
         mood_text = text_input.lower()
-    elif image_input_b64:
-        image_bytes = base64.b64decode(image_input_b64)
-        image = Image.open(BytesIO(image_bytes)).convert("RGB")
-        mood_text = predict_mood_from_face(image)
     else:
-        return jsonify({"error": "No input provided"}), 400
+        return jsonify({"error": "No text input provided"}), 400
 
-    # Mood lifting
     if lifting_mode:
         for neg, pos in mood_lifting_map.items():
             if neg in mood_text.split():
+                print(f"[Mood Lifting] {mood_text} → {pos}")
                 mood_text = pos
                 break
 
     prompt = make_prompt(mood_text)
 
-    # Generate images
-    images_b64 = []
-    pil_images = []
-    for _ in range(4):
-        if device == "cuda":
-            with torch.autocast("cuda"):
-                img = sd_pipe(prompt, height=512, width=512, num_inference_steps=50, guidance_scale=10.0).images[0]
-        else:
-            img = sd_pipe(prompt, height=512, width=512, num_inference_steps=50, guidance_scale=10.0).images[0]
-        pil_images.append(img)
-        images_b64.append(img_to_base64(img))
+    try:
+        images_b64 = fetch_leonardo_images(prompt)
+        img_base64_data = images_b64[0].split(",")[-1]
+        palette = extract_hex_palette(img_base64_data)
 
-    # Extract color palette
-    palette = extract_palette([img_to_base64(img) for img in pil_images])
-    
-    return jsonify({
-        "mood": mood_text,
-        "prompt": prompt,
-        "images": images_b64,
-        "palette": palette
-    })
+        return jsonify({
+            "mood": mood_text,
+            "prompt": prompt,
+            "images": images_b64,
+            "palette": palette
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
-
-from flask import send_from_directory
-
+# Serve static frontend files
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_react(path):
-    if path != "" and os.path.exists(os.path.join("frontend", "build", path)):
-        return send_from_directory(os.path.join("frontend", "build"), path)
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
     else:
-        return send_from_directory(os.path.join("frontend", "build"), "index.html")
+        return send_from_directory(app.static_folder, "index.html")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
