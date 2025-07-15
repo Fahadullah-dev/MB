@@ -39,7 +39,6 @@ import base64
 
 from utils.color_extractor import extract_palette
 from utils.layout_selector import select_layout
-from fane_loader import predict_mood_from_face
 from mood_lifting_map import mood_lifting_map
 from diffusers import StableDiffusionPipeline
 
