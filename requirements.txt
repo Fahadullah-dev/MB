@@ -6,3 +6,4 @@ transformers
 Pillow
 gunicorn
 colorthief
+requests
